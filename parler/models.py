@@ -63,6 +63,7 @@ from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured, ValidationError, FieldError, ObjectDoesNotExist
 from django.db import models, router
 from django.db.models.base import ModelBase
+from django.db.models.signals import class_prepared
 from django.utils.encoding import python_2_unicode_compatible
 from django.utils.functional import lazy
 from django.utils.translation import ugettext, ugettext_lazy as _
@@ -167,7 +168,7 @@ def create_translations_model(shared_model, related_name, meta, **fields):
                                         on_delete=models.CASCADE)
 
     # Create and return the new model
-    translations_model = TranslatedFieldsModelBase(name, (TranslatedFieldsModel,), attrs)
+    translations_model = ModelBase(name, (TranslatedFieldsModel,), attrs)
 
     # Register it as a global in the shared model's module.
     # This is needed so that Translation model instances, and objects which refer to them, can be properly pickled and unpickled.
@@ -799,41 +800,6 @@ class TranslatableModel(TranslatableModelMixin, models.Model):
     objects = TranslatableManager()
 
 
-class TranslatedFieldsModelBase(ModelBase):
-    """
-    .. versionadded 1.2
-
-    Meta-class for the translated fields model.
-
-    It performs the following steps:
-
-    * It validates the 'master' field, in case it's added manually.
-    * It tells the original model to use this model for translations.
-    * It adds the proxy attributes to the shared model.
-    """
-    def __new__(mcs, name, bases, attrs):
-
-        # Workaround compatibility issue with six.with_metaclass() and custom Django model metaclasses:
-        if not attrs and name == 'NewBase':
-            return super(TranslatedFieldsModelBase, mcs).__new__(mcs, name, bases, attrs)
-
-        new_class = super(TranslatedFieldsModelBase, mcs).__new__(mcs, name, bases, attrs)
-        if bases[0] == models.Model:
-            return new_class
-
-        # No action in abstract models.
-        if new_class._meta.abstract or new_class._meta.proxy:
-            return new_class
-
-        # Validate a manually configured class.
-        shared_model = _validate_master(new_class)
-
-        # Add wrappers for all translated fields to the shared models.
-        new_class.contribute_translations(shared_model)
-
-        return new_class
-
-
 def _validate_master(new_class):
     """
     Check whether the 'master' field on a TranslatedFieldsModel is correctly configured.
@@ -848,11 +814,7 @@ def _validate_master(new_class):
         # Django <= 1.8 compatibility
         shared_model = remote_field.to
 
-    if not issubclass(shared_model, models.Model):
-        # Not supporting models.ForeignKey("tablename") yet. Can't use get_model() as the models are still being constructed.
-        raise ImproperlyConfigured("{0}.master should point to a model class, can't use named field here.".format(new_class.__name__))
-
-    meta = shared_model._parler_meta
+    meta = getattr(shared_model, '_parler_meta', None)
     if meta is not None:
         if meta._has_translations_model(new_class):
             raise ImproperlyConfigured("The model '{0}' already has an associated translation table!".format(shared_model.__name__))
@@ -863,23 +825,16 @@ def _validate_master(new_class):
 
 
 @python_2_unicode_compatible
-class TranslatedFieldsModel(six.with_metaclass(TranslatedFieldsModelBase, models.Model)):
+class TranslatedFieldsModelMixin(object):
     """
     Base class for the model that holds the translated fields.
     """
-    language_code = compat.HideChoicesCharField(_("Language"), choices=settings.LANGUAGES, max_length=15, db_index=True)
-
     #: The mandatory Foreign key field to the shared model.
     master = None   # FK to shared model.
 
-    class Meta:
-        abstract = True
-        if django.VERSION >= (1, 7):
-            default_permissions = ()
-
     def __init__(self, *args, **kwargs):
         signals.pre_translation_init.send(sender=self.__class__, args=args, kwargs=kwargs)
-        super(TranslatedFieldsModel, self).__init__(*args, **kwargs)
+        super(TranslatedFieldsModelMixin, self).__init__(*args, **kwargs)
         self._original_values = self._get_field_values()
 
         signals.post_translation_init.send(sender=self.__class__, args=args, kwargs=kwargs)
@@ -937,7 +892,7 @@ class TranslatedFieldsModel(six.with_metaclass(TranslatedFieldsModelBase, models
             )
 
         # Perform save
-        super(TranslatedFieldsModel, self).save_base(raw=raw, using=using, **kwargs)
+        super(TranslatedFieldsModelMixin, self).save_base(raw=raw, using=using, **kwargs)
         self._original_values = self._get_field_values()
         _cache_translation(self)
 
@@ -954,7 +909,7 @@ class TranslatedFieldsModel(six.with_metaclass(TranslatedFieldsModelBase, models
         if not self._meta.auto_created:
             signals.pre_translation_delete.send(sender=self.shared_model, instance=self, using=using)
 
-        super(TranslatedFieldsModel, self).delete(using=using)
+        super(TranslatedFieldsModelMixin, self).delete(using=using)
         _delete_cached_translation(self)
 
         # Send post-delete signal
@@ -1045,6 +1000,15 @@ class TranslatedFieldsModel(six.with_metaclass(TranslatedFieldsModelBase, models
         return "<{0}: #{1}, {2}, master: #{3}>".format(
             self.__class__.__name__, self.pk, self.language_code, self.master_id
         )
+
+
+class TranslatedFieldsModel(TranslatedFieldsModelMixin, models.Model):
+    language_code = compat.HideChoicesCharField(_("Language"), choices=settings.LANGUAGES, max_length=15, db_index=True)
+
+    class Meta:
+        abstract = True
+        if django.VERSION >= (1, 7):
+            default_permissions = ()
 
 
 class ParlerMeta(object):
@@ -1249,3 +1213,28 @@ class ParlerOptions(object):
                     pass
 
             yield (meta, model_fields)
+
+
+def contribute_translations(sender, **kwargs):
+    if issubclass(sender, TranslatedFieldsModelMixin):
+        if sender._meta.proxy:
+            return
+        # When the migration framework renders models for apps without any
+        # migrations, these models do not include relationship fields. We
+        # don't have to add any proxy fields here, as these are only used to
+        # create the database table.
+        if sender.__module__ == '__fake__' and not sender.master:
+            return
+        # Validate a manually configured class.
+        shared_model = _validate_master(sender)
+        # Add wrappers for all translated fields to the shared models.
+        if django.VERSION >= (1, 9):
+            from django.db.models.utils import make_model_tuple
+            shared_model_tuple = make_model_tuple(shared_model)
+            sender._meta.apps.lazy_model_operation(sender.contribute_translations, shared_model_tuple)
+        else:
+            from django.db.models.fields.related import add_lazy_relation
+            def set_relations(field, shared_model, translations_model):
+                translations_model.contribute_translations(shared_model)
+            add_lazy_relation(sender, None, shared_model, set_relations)
+class_prepared.connect(contribute_translations)

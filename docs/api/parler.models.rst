@@ -25,13 +25,6 @@ The ``TranslatedFieldsModel`` model
    :members:
 
 
-The ``TranslatedFieldsModelBase`` metaclass
--------------------------------------------
-
-.. autoclass:: parler.models.TranslatedFieldsModelBase
-   :members:
-
-
 The ``TranslationDoesNotExist`` exception
 -----------------------------------------
 
